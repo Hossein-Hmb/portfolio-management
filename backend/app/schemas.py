@@ -101,6 +101,9 @@ class PortfolioSummary(BaseModel):
     unrealized_pl: float
     unrealized_pl_pct: float
     realized_pl: float
+    net_deposits: float
+    total_return: float
+    total_return_pct: float
     day_change: float
     day_change_pct: float
     by_asset_type: List[AllocationSlice]
@@ -124,3 +127,57 @@ class PerformanceOut(BaseModel):
     max_drawdown: float
     sharpe: float
     series: List[TimeSeriesPoint]
+
+
+# ---------- Trade analysis (rules engine) ----------
+
+class TradeProposalIn(BaseModel):
+    ticker: str
+    action: str = Field(description="buy or sell")
+    instrument: str = Field(description="stock | call | put")
+    quantity: float
+    total_capital: float
+    strike: Optional[float] = None
+    expiry: Optional[date] = None
+    premium: Optional[float] = None
+    edge_thesis: str = ""
+    profit_target: Optional[float] = None
+    stop_loss: Optional[float] = None
+    win_probability: Optional[float] = None
+    expected_profit: Optional[float] = None
+    expected_loss: Optional[float] = None
+
+
+class ProposalDecisionIn(BaseModel):
+    decision: Optional[str] = None          # entered | skipped | pending
+    outcome: Optional[str] = None           # win | loss | breakeven | open
+    realized_pl: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class ProposalOut(BaseModel):
+    id: int
+    created_at: datetime
+    ticker: str
+    action: str
+    instrument: str
+    quantity: float
+    total_capital: float
+    strike: Optional[float]
+    expiry: Optional[date]
+    premium: Optional[float]
+    edge_thesis: str
+    profit_target: Optional[float]
+    stop_loss: Optional[float]
+    win_probability: Optional[float]
+    expected_profit: Optional[float]
+    expected_loss: Optional[float]
+    recommendation: str
+    score: float
+    decision: str
+    outcome: str
+    realized_pl: Optional[float]
+    notes: str
+
+    class Config:
+        from_attributes = True

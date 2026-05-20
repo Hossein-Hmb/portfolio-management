@@ -7,11 +7,23 @@ from . import models, quotes
 
 
 CASH_TYPES = {"deposit", "withdrawal", "interest", "dividend", "fee", "transfer_in", "transfer_out"}
+SNAPSHOT_NOTE_PREFIXES = ("snapshot", "holdings-report import")
+NET_DEPOSIT_NOTE_PREFIX = "net deposit snapshot"
+
+
+def _is_snapshot_position(t: models.Transaction) -> bool:
+    return bool(t.notes) and t.notes.startswith(SNAPSHOT_NOTE_PREFIXES)
+
+
+def _is_net_deposit_snapshot(t: models.Transaction) -> bool:
+    return bool(t.notes) and t.notes.startswith(NET_DEPOSIT_NOTE_PREFIX)
 
 
 def _signed_cash(t: models.Transaction) -> float:
     """Return cash flow into the account in account currency."""
     amt = 0.0
+    if _is_snapshot_position(t) or _is_net_deposit_snapshot(t):
+        return amt
     if t.type == "buy":
         amt = -(t.quantity * t.price + t.fees) * t.fx_rate
     elif t.type == "sell":
@@ -37,13 +49,18 @@ def compute_holdings(db: Session) -> List[dict]:
              .all())
 
     for t in txs:
-        if t.instrument_id is None or t.type not in ("buy", "sell"):
+        if t.instrument_id is None or t.type not in ("buy", "sell", "split"):
             continue
         key = (t.account_id, t.instrument_id)
         pos = rows.setdefault(key, {"units": 0.0, "cost_basis": 0.0})
         if t.type == "buy":
             pos["units"] += t.quantity
             pos["cost_basis"] += t.quantity * t.price + t.fees
+        elif t.type == "split":
+            pos["units"] += t.quantity
+            if pos["units"] <= 1e-9:
+                pos["units"] = 0.0
+                pos["cost_basis"] = 0.0
         else:  # sell
             avg = (pos["cost_basis"] / pos["units"]) if pos["units"] else 0.0
             proceeds = t.quantity * t.price - t.fees
@@ -84,9 +101,12 @@ def compute_holdings(db: Session) -> List[dict]:
             "account_name": acct.name,
             "units": round(pos["units"], 6),
             "avg_cost": round(avg, 4),
+            "cost_basis_raw": pos["cost_basis"],
             "cost_basis": round(pos["cost_basis"], 2),
             "last_price": round(last, 4),
+            "market_value_raw": mv,
             "market_value": round(mv, 2),
+            "unrealized_pl_raw": upl,
             "unrealized_pl": round(upl, 2),
             "unrealized_pl_pct": round(upl_pct, 2),
             "weight": 0.0,
@@ -107,6 +127,17 @@ def compute_cash_balances(db: Session) -> Dict[int, float]:
     for t in db.query(models.Transaction).all():
         bal[t.account_id] += _signed_cash(t)
     return bal
+
+
+def compute_net_deposits(db: Session) -> float:
+    """Return net external deposits in account currency."""
+    total = 0.0
+    for t in db.query(models.Transaction).all():
+        if t.type in ("deposit", "transfer_in"):
+            total += (t.price or t.quantity) * t.fx_rate
+        elif t.type in ("withdrawal", "transfer_out"):
+            total -= (t.price or t.quantity) * t.fx_rate
+    return round(total, 2)
 
 
 def compute_realized_pl(db: Session) -> float:
@@ -134,8 +165,9 @@ def allocation_breakdown(holdings, key) -> list:
     buckets = defaultdict(float)
     total = 0.0
     for h in holdings:
-        buckets[h.get(key) or "Unknown"] += h["market_value"]
-        total += h["market_value"]
+        value = h.get("market_value_raw", h["market_value"])
+        buckets[h.get(key) or "Unknown"] += value
+        total += value
     out = [{"label": k, "value": round(v, 2),
             "pct": round((v / total * 100.0) if total else 0.0, 2)}
            for k, v in buckets.items()]
@@ -147,12 +179,15 @@ def portfolio_summary(db: Session) -> dict:
     holdings = compute_holdings(db)
     cash_by_acct = compute_cash_balances(db)
     cash_total = sum(cash_by_acct.values())
-    invested = sum(h["market_value"] for h in holdings)
+    invested = sum(h.get("market_value_raw", h["market_value"]) for h in holdings)
     total = invested + cash_total
-    cost = sum(h["cost_basis"] for h in holdings)
+    cost = sum(h.get("cost_basis_raw", h["cost_basis"]) for h in holdings)
     upl = invested - cost
     upl_pct = (upl / cost * 100.0) if cost else 0.0
     realized = compute_realized_pl(db)
+    net_deposits = compute_net_deposits(db)
+    total_return = total - net_deposits
+    total_return_pct = (total_return / net_deposits * 100.0) if net_deposits else 0.0
 
     # Day change: sum of units * (last - prev_close)
     day_change = 0.0
@@ -165,7 +200,7 @@ def portfolio_summary(db: Session) -> dict:
     by_acct = defaultdict(float)
     accounts = {a.id: a for a in db.query(models.Account).all()}
     for h in holdings:
-        by_acct[h["account_name"]] += h["market_value"]
+        by_acct[h["account_name"]] += h.get("market_value_raw", h["market_value"])
     for aid, c in cash_by_acct.items():
         name = accounts[aid].name if aid in accounts else f"Account {aid}"
         by_acct[name] += c
@@ -186,6 +221,9 @@ def portfolio_summary(db: Session) -> dict:
         "unrealized_pl": round(upl, 2),
         "unrealized_pl_pct": round(upl_pct, 2),
         "realized_pl": realized,
+        "net_deposits": net_deposits,
+        "total_return": round(total_return, 2),
+        "total_return_pct": round(total_return_pct, 2),
         "day_change": round(day_change, 2),
         "day_change_pct": round(day_pct, 2),
         "by_asset_type": allocation_breakdown(holdings, "asset_type"),
@@ -201,23 +239,42 @@ def portfolio_summary(db: Session) -> dict:
 # ---------- Performance (TWR, XIRR, drawdown, vol, sharpe) ----------
 
 def _portfolio_value_series(db: Session) -> List[tuple]:
-    """Replay the ledger and compute portfolio value (cash + holdings @ last price) per day.
-    For MVP: use last known price for every historical day (good enough; you can swap in
-    historical bars later)."""
+    """Replay the ledger and compute portfolio value (cash + holdings @ historical
+    close) per day. Falls back to the last live quote for tickers without history."""
     txs = (db.query(models.Transaction)
              .order_by(models.Transaction.date.asc(), models.Transaction.id.asc()).all())
     if not txs:
         return []
     instruments = {i.id: i for i in db.query(models.Instrument).all()}
-    quote_cache = {}
-
-    def last(ticker):
-        if ticker not in quote_cache:
-            quote_cache[ticker] = quotes.get_quote(db, ticker)["last_price"]
-        return quote_cache[ticker]
-
     start = txs[0].date
     end = date.today()
+
+    # Pre-fetch per-ticker historical bars and forward-fill so every calendar day
+    # has a price.
+    price_by_day: Dict[str, Dict[date, float]] = {}
+    fallback: Dict[str, float] = {}
+    cached_prices = {p.ticker: p.last_price for p in db.query(models.PriceCache).all()}
+    for inst in instruments.values():
+        hist = quotes.get_history(db, inst.ticker)
+        if hist:
+            filled: Dict[date, float] = {}
+            last_p = 0.0
+            d = start
+            while d <= end:
+                if d in hist:
+                    last_p = hist[d]
+                if last_p:
+                    filled[d] = last_p
+                d += timedelta(days=1)
+            price_by_day[inst.ticker] = filled
+        else:
+            fallback[inst.ticker] = cached_prices.get(inst.ticker) or 0.0
+
+    def price(ticker: str, d: date) -> float:
+        if ticker in price_by_day:
+            return price_by_day[ticker].get(d, 0.0)
+        return fallback.get(ticker, 0.0)
+
     series = []
     cash = 0.0
     units: Dict[int, float] = defaultdict(float)
@@ -227,8 +284,11 @@ def _portfolio_value_series(db: Session) -> List[tuple]:
         while idx < len(txs) and txs[idx].date <= d:
             t = txs[idx]
             cash += _signed_cash(t)
-            if t.instrument_id is not None and t.type in ("buy", "sell"):
-                units[t.instrument_id] += t.quantity if t.type == "buy" else -t.quantity
+            if t.instrument_id is not None and t.type in ("buy", "sell", "split"):
+                if t.type == "buy" or t.type == "split":
+                    units[t.instrument_id] += t.quantity
+                else:
+                    units[t.instrument_id] -= t.quantity
             idx += 1
         mv = cash
         for iid, u in units.items():
@@ -237,7 +297,7 @@ def _portfolio_value_series(db: Session) -> List[tuple]:
             inst = instruments.get(iid)
             if not inst:
                 continue
-            mv += u * last(inst.ticker)
+            mv += u * price(inst.ticker, d)
         series.append((d, round(mv, 2)))
         d += timedelta(days=1)
     return series
@@ -282,6 +342,8 @@ def performance(db: Session) -> dict:
     # External cash flows per date (deposit/withdrawal/transfer)
     external = defaultdict(float)
     for t in db.query(models.Transaction).all():
+        if _is_net_deposit_snapshot(t):
+            continue
         if t.type in ("deposit", "transfer_in"):
             external[t.date] += (t.price or t.quantity) * t.fx_rate
         elif t.type in ("withdrawal", "transfer_out"):

@@ -28,3 +28,15 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+
+CLAUDE.md
+
+# Personal data exports
+holdings-report-*.csv
+activities-export-*.csv
+
+# Personal importers (contain account-specific mappings)
+backend/import_wealthsimple.py
+
+# TypeScript build cache
+*.tsbuildinfo

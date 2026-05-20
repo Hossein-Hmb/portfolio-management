@@ -2,12 +2,52 @@
 import useSWR from "swr";
 import Link from "next/link";
 import { useState, useMemo } from "react";
-import { fetcher, fmtMoney, fmtPct, cls } from "@/lib/api";
+import { api, fetcher, fmtMoney, fmtPct, cls } from "@/lib/api";
 
 export default function Holdings() {
   const { data, error, isLoading, mutate } = useSWR<any[]>("/api/holdings", fetcher);
+  const { data: accts } = useSWR<any[]>("/api/accounts", fetcher);
   const [q, setQ] = useState("");
   const [tag, setTag] = useState("");
+
+  const [form, setForm] = useState<any>({
+    account_id: "", ticker: "", quantity: "", avg_cost: "", currency: "CAD",
+  });
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function addHolding(e: any) {
+    e.preventDefault();
+    setErr(null);
+    if (!form.account_id || !form.ticker || !form.quantity || !form.avg_cost) {
+      setErr("Account, ticker, shares, and average cost are required.");
+      return;
+    }
+    setSaving(true);
+    try {
+      await api("/api/transactions", {
+        method: "POST",
+        body: JSON.stringify({
+          account_id: Number(form.account_id),
+          ticker: form.ticker.toUpperCase(),
+          date: new Date().toISOString().slice(0, 10),
+          type: "buy",
+          quantity: Number(form.quantity),
+          price: Number(form.avg_cost),
+          fees: 0,
+          currency: form.currency,
+          fx_rate: 1,
+          notes: "snapshot",
+        }),
+      });
+      setForm({ ...form, ticker: "", quantity: "", avg_cost: "" });
+      mutate();
+    } catch (e: any) {
+      setErr(String(e.message || e));
+    } finally {
+      setSaving(false);
+    }
+  }
 
   const rows = useMemo(() => {
     if (!data) return [];
@@ -27,6 +67,40 @@ export default function Holdings() {
 
   return (
     <div className="space-y-4">
+      <form onSubmit={addHolding} className="card grid grid-cols-2 md:grid-cols-6 gap-3">
+        <div className="md:col-span-6">
+          <div className="font-medium">Add a holding</div>
+          <div className="text-xs text-muted">Enter what you currently own — shares and your average cost. We&apos;ll record it as a buy dated today.</div>
+        </div>
+        <div>
+          <label>Account</label>
+          <select value={form.account_id} onChange={(e) => setForm({ ...form, account_id: e.target.value })} required>
+            <option value="">—</option>
+            {accts?.map((a: any) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <label>Ticker</label>
+          <input value={form.ticker} onChange={(e) => setForm({ ...form, ticker: e.target.value.toUpperCase() })} placeholder="AAPL" />
+        </div>
+        <div>
+          <label>Shares</label>
+          <input type="number" step="any" value={form.quantity} onChange={(e) => setForm({ ...form, quantity: e.target.value })} placeholder="10" />
+        </div>
+        <div>
+          <label>Average cost / share</label>
+          <input type="number" step="any" value={form.avg_cost} onChange={(e) => setForm({ ...form, avg_cost: e.target.value })} placeholder="185.50" />
+        </div>
+        <div>
+          <label>Currency</label>
+          <input value={form.currency} onChange={(e) => setForm({ ...form, currency: e.target.value.toUpperCase() })} />
+        </div>
+        <div className="flex items-end">
+          <button className="btn btn-primary w-full" type="submit" disabled={saving}>{saving ? "Saving…" : "Add holding"}</button>
+        </div>
+        {err && <div className="md:col-span-6 neg text-sm">{err}</div>}
+      </form>
+
       <div className="flex flex-wrap gap-2 items-end">
         <div className="w-60">
           <label>Search</label>
